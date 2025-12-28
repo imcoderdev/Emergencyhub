@@ -5,10 +5,14 @@ const http = require('http');
 const path = require('path');
 const fs = require('fs');
 const socketIo = require('socket.io');
+const helmet = require('helmet');
+const compression = require('compression');
+const rateLimit = require('express-rate-limit');
 require('dotenv').config();
 
 const app = express();
 const server = http.createServer(app);
+const isProduction = process.env.NODE_ENV === 'production';
 
 // Create uploads directory if it doesn't exist
 const uploadsDir = path.join(__dirname, 'uploads');
@@ -16,19 +20,106 @@ if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
 }
 
+// ============================================
+// PRODUCTION SECURITY MIDDLEWARE
+// ============================================
+
+// Security headers with Helmet
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
+  crossOriginEmbedderPolicy: false,
+  contentSecurityPolicy: false // Disable CSP for API
+}));
+
+// Compression for responses
+app.use(compression());
+
+// Rate limiting - General API limiter
+const generalLimiter = rateLimit({
+  windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 15 * 60 * 1000, // 15 minutes
+  max: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS) || 100, // limit each IP to 100 requests per window
+  message: { error: 'Too many requests, please try again later.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => !isProduction && req.ip === '::1' // Skip in dev for localhost
+});
+
+// Strict rate limiter for incident reporting (prevent spam)
+const reportLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000, // 5 minutes
+  max: 10, // limit each IP to 10 reports per 5 minutes
+  message: { error: 'Too many incident reports. Please wait before submitting again.' },
+  standardHeaders: true,
+  legacyHeaders: false
+});
+
+// AI analysis rate limiter (expensive operations)
+const aiLimiter = rateLimit({
+  windowMs: 1 * 60 * 1000, // 1 minute
+  max: 20, // limit each IP to 20 AI requests per minute
+  message: { error: 'AI analysis rate limit exceeded. Please wait.' },
+  standardHeaders: true,
+  legacyHeaders: false
+});
+
+// Apply general limiter to all routes
+app.use(generalLimiter);
+
 // Socket.IO setup with CORS
 const io = socketIo(server, {
   cors: {
-    origin: '*',
-    methods: ['GET', 'POST', 'PATCH', 'DELETE']
+    origin: (origin, callback) => {
+      // Allow all Vercel domains and localhost
+      if (!origin || origin.includes('.vercel.app') || origin.includes('localhost') || origin.includes('127.0.0.1')) {
+        callback(null, true);
+      } else {
+        callback(null, true); // Allow all for hackathon demo
+      }
+    },
+    methods: ['GET', 'POST', 'PATCH', 'DELETE'],
+    credentials: true
   }
 });
 
 // Make io accessible to routes
 app.set('io', io);
 
+// Allowed origins for CORS
+const allowedOrigins = [
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+  'http://localhost:5174',
+  'http://127.0.0.1:5174',
+  'https://emergency-frontend-gx2k.vercel.app',
+  process.env.FRONTEND_URL
+].filter(Boolean);
+
 // Middleware
-app.use(cors()); // Enable CORS for all routes
+app.use(cors({
+  origin: (origin, callback) => {
+    // Allow requests with no origin (like mobile apps or Postman)
+    if (!origin) return callback(null, true);
+    
+    // In development, allow all localhost origins
+    if (process.env.NODE_ENV !== 'production' && (origin.includes('localhost') || origin.includes('127.0.0.1'))) {
+      return callback(null, true);
+    }
+    
+    // Allow all Vercel domains
+    if (origin.includes('.vercel.app')) {
+      return callback(null, true);
+    }
+    
+    if (allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      console.log('CORS blocked origin:', origin);
+      // In production, still allow but log it
+      callback(null, true);
+    }
+  },
+  credentials: true
+}));
 app.use(express.json()); // JSON parsing middleware
 app.use(express.urlencoded({ extended: true })); // Parse URL-encoded bodies
 
@@ -102,6 +193,7 @@ app.get('/', (req, res) => {
     message: 'Emergency Incident Reporting Platform API',
     status: 'Running',
     version: '1.0.0',
+    environment: isProduction ? 'production' : 'development',
     connectedClients,
     endpoints: {
       health: 'GET /api/health',
@@ -122,12 +214,16 @@ app.get('/api/health', (req, res) => {
   res.json({ 
     status: 'OK',
     timestamp: new Date().toISOString(),
+    environment: isProduction ? 'production' : 'development',
     connectedClients,
     mongoStatus: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected'
   });
 });
 
-// Mount Incidents Routes
+// Mount Incidents Routes with specific rate limiters
+app.use('/api/incidents/report', reportLimiter); // Stricter limit for reporting
+app.use('/api/incidents/analyze', aiLimiter); // AI analysis limit
+app.use('/api/incidents/:id/analyze', aiLimiter); // AI analysis limit
 app.use('/api/incidents', incidentsRouter);
 
 // Error handling middleware
